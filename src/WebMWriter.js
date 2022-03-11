@@ -847,6 +847,10 @@
                 // Frame timecodes are relative to the start of their cluster:
                 chunk.timecode = Math.round(time - clusterStartTime);
                 clusterFrameBuffer.push(chunk);
+                // this assignment is currently only relevant on the last frame
+                // since clusterDuration is only used with `flushClusterFrameBuffer`
+                // and in all other cases besides the last frame, clusterDuration
+                // is set immediately before calling `flushClusterFrameBuffer`
                 clusterDuration = chunk.timecode + duration;
             }
 
