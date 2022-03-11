@@ -188,9 +188,9 @@
                     sizePos = buffer.pos;
                     
                     /* Write a dummy size field to overwrite later. 4 bytes allows an element maximum size of 256MB,
-					 * which should be plenty (we don't want to have to buffer that much data in memory at one time
-					 * anyway!)
-					 */
+                     * which should be plenty (we don't want to have to buffer that much data in memory at one time
+                     * anyway!)
+                     */
                     buffer.writeBytes([0, 0, 0, 0]);
                 }
                 
@@ -267,11 +267,12 @@
     let WebMWriter = function(ArrayBufferDataStream, BlobBuffer) {
         return function(options) {
             let
-                MAX_CLUSTER_DURATION_MSEC = 5000,
+                TARGET_CLUSTER_DURATION_MSEC = 5000, // may exceed this if added frames aren't keyframes
                 DEFAULT_TRACK_NUMBER = 1,
             
                 writtenHeader = false,
                 videoWidth = 0, videoHeight = 0,
+                firstTimestamp = null,
     
                 /**
                  * @type {[HTMLCanvasElement]}
@@ -304,7 +305,10 @@
                                              // If not specified this defaults to the same value as `quality`.
                     
                     fileWriter: null,    // Chrome FileWriter in order to stream to a file instead of buffering to memory (optional)
-                    fd: null,            // Node.JS file descriptor to write to instead of buffering (optional)
+                    fd: null,            // Node.JS file descriptor to write to instead of buffering (optional),
+
+                    codec: "VP8",
+                    codecName: "VP8",
                     
                     // You must supply one of:
                     frameDuration: null, // Duration of frames in milliseconds
@@ -519,11 +523,11 @@
                                     },
                                     {
                                         "id": 0x86, // CodecID
-                                        "data": "V_VP8"
+                                        "data": "V_" + options.codec
                                     },
                                     {
                                         "id": 0x258688, // CodecName
-                                        "data": "VP8"
+                                        "data": options.codecName
                                     },
                                     {
                                         "id": 0x83, // TrackType
@@ -558,7 +562,7 @@
                 seekPoints.SegmentInfo.positionEBML.data = fileOffsetToSegmentRelative(segmentInfo.offset);
                 seekPoints.Tracks.positionEBML.data = fileOffsetToSegmentRelative(tracks.offset);
                 
-	            writtenHeader = true;
+                writtenHeader = true;
             }
     
             /**
@@ -628,26 +632,35 @@
              * @return A SimpleBlock EBML element.
              */
             function createSimpleBlockForKeyframe(keyframe) {
+                createSimpleBlockForFrame(keyframe, true);
+            }
+            function createSimpleBlockForFrame(frame, isKeyframe) {
                 let
                     bufferStream = new ArrayBufferDataStream(1 + 2 + 1);
                 
-                if (!(keyframe.trackNumber > 0 && keyframe.trackNumber < 127)) {
+                if (!(frame.trackNumber > 0 && frame.trackNumber < 127)) {
                     throw new Error("TrackNumber must be > 0 and < 127");
                 }
     
-                bufferStream.writeEBMLVarInt(keyframe.trackNumber); // Always 1 byte since we limit the range of trackNumber
-                bufferStream.writeU16BE(keyframe.timecode);
+                bufferStream.writeEBMLVarInt(frame.trackNumber); // Always 1 byte since we limit the range of trackNumber
+                bufferStream.writeU16BE(frame.timecode);
                 
                 // Flags byte
-                bufferStream.writeByte(
-                    1 << 7 // Keyframe
-                );
+                if (isKeyframe) {
+                    bufferStream.writeByte(
+                        1 << 7 // Keyframe
+                    );
+                } else {
+                    bufferStream.writeByte(
+                        0 // Not a keyframe
+                    );
+                }
                 
                 return {
                     "id": 0xA3, // SimpleBlock
                     "data": [
                          bufferStream.getAsDataArray(),
-                         keyframe.frame
+                         frame.frame
                     ]
                 };
             }
@@ -657,12 +670,12 @@
              *
              * @param {Frame} keyframe
              */
-            function createContainerForKeyframe(keyframe) {
-                if (keyframe.alpha) {
-                    return createBlockGroupForTransparentKeyframe(keyframe);
+            function createContainerForFrame(frame, isKeyframe) {
+                if (isKeyframe && frame.alpha) {
+                    return createBlockGroupForTransparentKeyframe(frame);
                 }
                 
-                return createSimpleBlockForKeyframe(keyframe);
+                return createSimpleBlockForFrame(frame, isKeyframe);
             }
         
             /**
@@ -742,7 +755,7 @@
                     rawImageSize = 0;
                 
                 for (let i = 0; i < clusterFrameBuffer.length; i++) {
-                    rawImageSize += clusterFrameBuffer[i].frame.length + (clusterFrameBuffer[i].alpha ? clusterFrameBuffer[i].alpha.length : 0);
+                    rawImageSize += clusterFrameBuffer[i].frameByteLength + (clusterFrameBuffer[i].alpha ? clusterFrameBuffer[i].alpha.length : 0);
                 }
                 
                 let
@@ -753,7 +766,7 @@
                     });
                 
                 for (let i = 0; i < clusterFrameBuffer.length; i++) {
-                    cluster.data.push(createContainerForKeyframe(clusterFrameBuffer[i]));
+                    cluster.data.push(createContainerForFrame(clusterFrameBuffer[i], clusterFrameBuffer[i].frameType === "key"));
                 }
                 
                 writeEBML(buffer, blobBuffer.pos, cluster);
@@ -791,6 +804,12 @@
              * @param {Frame} frame
              */
             function addFrameToCluster(frame) {
+                // It's recommended to put keyframes at the beginning of a cluster
+                // addFrameToCluster always adds keyframes, though addChunkToCluster
+                // doesn't necessarily
+                if (clusterDuration >= TARGET_CLUSTER_DURATION_MSEC) {
+                    flushClusterFrameBuffer();
+                }
                 frame.trackNumber = DEFAULT_TRACK_NUMBER;
                 
                 // Frame timecodes are relative to the start of their cluster:
@@ -799,12 +818,38 @@
                 clusterFrameBuffer.push(frame);
                 
                 clusterDuration += frame.duration;
-                
-                if (clusterDuration >= MAX_CLUSTER_DURATION_MSEC) {
+            }
+
+            /**
+             *
+             * @param {EncodedVideoChunk} chunk
+             */
+            function addChunkToCluster(chunk) {
+                chunk.trackNumber = DEFAULT_TRACK_NUMBER;
+                var time = chunk.timestamp / 1000; // timestamp is in microseconds, so time is in ms
+                var duration = Math.floor((chunk.duration || 0) / 1000);
+                if (duration === 0) {
+                    duration = 1;
+                }
+                if (options.skipToFirstTimestamp) {
+                    if (firstTimestamp === null) {
+                        firstTimestamp = time;
+                        clusterStartTime = time;
+                    }
+                    time = time - firstTimestamp;
+                }
+                // it's recommended to start each cluster with a keyframe
+                if (clusterDuration >= TARGET_CLUSTER_DURATION_MSEC && chunk.frameType === "key") {
+                    clusterDuration = Math.round(time - clusterStartTime);
                     flushClusterFrameBuffer();
                 }
+
+                // Frame timecodes are relative to the start of their cluster:
+                chunk.timecode = Math.round(time - clusterStartTime);
+                clusterFrameBuffer.push(chunk);
+                clusterDuration = chunk.timecode + duration;
             }
-            
+
             /**
              * Rewrites the SeekHead element that was initially written to the stream with the offsets of top level elements.
              *
@@ -887,7 +932,6 @@
                 if (!writtenHeader) {
                     videoWidth = frame.width || 0;
                     videoHeight = frame.height || 0;
-    
                     writeHeader();
                 }
     
@@ -913,10 +957,29 @@
                 
                 addFrameToCluster({
                     frame: keyframe.frame,
+                    frameByteLength: keyframe.frame.length,
+                    frameType: "key",
                     duration: frameDuration,
                     alpha: frameAlpha ? extractKeyframeFromWebP(renderAsWebP(frameAlpha, options.alphaQuality)).frame : null
                 });
             };
+
+            this.addChunk = function(chunk) {
+                if (!writtenHeader) {
+                    videoWidth = options.width;
+                    videoHeight = options.height;
+                    writeHeader();
+                }
+                let chunkData = new Uint8Array(chunk.byteLength);
+                chunk.copyTo(chunkData);
+                addChunkToCluster({
+                    frame: chunkData,
+                    frameByteLength: chunkData.byteLength,
+                    duration: chunk.duration,
+                    timestamp: chunk.timestamp, // timestamp is in microseconds
+                    frameType: chunk.type
+                });
+            }
             
             /**
              * Finish writing the video and return a Promise to signal completion.
@@ -925,10 +988,10 @@
              * a Blob with the contents of the entire video.
              */
             this.complete = function() {
-            	if (!writtenHeader) {
-		            writeHeader();
-	            }
-	            
+                if (!writtenHeader) {
+                    writeHeader();
+                }
+
                 flushClusterFrameBuffer();
                 writeCues();
                 
