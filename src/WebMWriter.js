@@ -829,7 +829,7 @@
                 var time = chunk.timestamp / 1000; // timestamp is in microseconds, so time is in ms
                 var duration = Math.floor((chunk.duration || 0) / 1000);
                 if (duration === 0) {
-                    duration = 1;
+                    duration = Math.round(options.frameDuration) || 1;
                 }
                 if (options.skipToFirstTimestamp) {
                     if (firstTimestamp === null) {
